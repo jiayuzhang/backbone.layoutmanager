@@ -64,6 +64,7 @@ var LayoutManager = Backbone.View.extend({
     // Ensure all nested Views are properly scrubbed if re-rendering.
     if (view.hasRendered) {
       view._removeViews();
+      view._cids = {}; // cleanup _cids, so that all subviews will re-attach
     }
 
     // This continues the render flow after `beforeRender` has completed.
@@ -352,7 +353,7 @@ var LayoutManager = Backbone.View.extend({
     // elements. The value at the specified filter may be undefined, a single
     // view, or an array of views; in all cases, chain on a flat array.
     if (typeof fn === "string") {
-      fn = this.sections[fn] || fn;
+      // fn = this.sections[fn] || fn;
       views = this.views[fn] || [];
 
       // If Views is undefined you are concatenating an `undefined` to an array
@@ -402,13 +403,14 @@ var LayoutManager = Backbone.View.extend({
   //
   // Must definitely wrap any render method passed in or defaults to a
   // typical render function `return layout(this).render()`.
-  setView: function(name, view, insert) {
+  setView: function(name, view, insert, prepend) {
     var manager, selector;
     // Parent view, the one you are setting a View on.
     var root = this;
 
     // If no name was passed, use an empty string and shift all arguments.
     if (typeof name !== "string") {
+      prepend = insert;
       insert = view;
       view = name;
       name = "";
@@ -429,7 +431,7 @@ var LayoutManager = Backbone.View.extend({
     manager.parent = root;
 
     // Add reference to the placement selector used.
-    selector = manager.selector = root.sections[name] || name;
+    selector = manager.selector = /*root.sections[name] ||*/ name;
 
     // Code path is less complex for Views that are not being inserted.  Simply
     // remove existing Views and bail out with the assignment.
@@ -446,7 +448,16 @@ var LayoutManager = Backbone.View.extend({
 
     // Ensure this.views[selector] is an array and push this View to
     // the end.
-    root.views[selector] = aConcat.call([], root.views[name] || [], view);
+    if (prepend) {
+      root.views[selector] = aConcat.call([], view, root.views[name] || []);
+
+      // !important, this is one-time flag, the prepended view will cleanup it once
+      // being rendered, usually the prepended one should render itself (not from parent)
+      // otherwise, the result unpredicted
+      manager.insertedAsPrepend = true;
+    } else {
+      root.views[selector] = aConcat.call([], root.views[name] || [], view);
+    }
 
     // Put the parent view into `insert` mode.
     root.__manager__.insert = true;
@@ -500,7 +511,7 @@ var LayoutManager = Backbone.View.extend({
       // If there is a parent and we weren't attached to it via the previous
       // method (single view), attach.
       if (parent && !manager.insertedViaFragment) {
-        if (!root.contains(parent.el, root.el)) {
+        if (!root.contains(parent, root)) {
           // Apply the partial using parent's html() method.
           parent.partial(parent.$el, root.$el, rentManager, manager);
         }
@@ -512,6 +523,13 @@ var LayoutManager = Backbone.View.extend({
       // Set this View as successfully rendered.
       root.hasRendered = true;
       manager.renderInProgress = false;
+
+      // hasRendered, store the cid in parent's cache
+      // NOTE, if insertedViaFragment, this node has not appeared
+      // in the DOM hierarchy yet until htmlBatch in parent's resolve
+      if (parent) {
+        parent._cids[root.cid] = 1;
+      }
 
       // Clear triggeredByRAF flag.
       delete manager.triggeredByRAF;
@@ -750,7 +768,15 @@ var LayoutManager = Backbone.View.extend({
 
     // In insert mode, remove views that do not have `keep` attribute set,
     // unless the force flag is set.
-    if ((!keep && rentManager && rentManager.insert === true) || force) {
+    
+    // ======================
+    // NOTE:
+    // This is the main confusing part, when re-render a view (in insert mode)
+    // it will remove all UNkeep subviews, we reject such behavior
+    // if ((!keep && rentManager && rentManager.insert === true) || force) {
+    // ======================
+
+    if (force) {
       // Clean out the events.
       LayoutManager.cleanViews(view);
 
@@ -786,6 +812,7 @@ var LayoutManager = Backbone.View.extend({
       }
 
       // Otherwise delete the parent selector.
+      delete manager.parent._cids[view.cid];
       delete manager.parent.views[manager.selector];
       manager.parent.trigger("empty", manager.selector);
     }
@@ -888,7 +915,13 @@ var LayoutManager = Backbone.View.extend({
         views: {},
 
         // Ensure a view always has a sections object.
-        sections: {},
+        // JIAYU: I just want to comment out this, making me super confused
+        // sections: {},
+
+        // Internal cache. Storing all rendered subviews cids
+        // As long as a subview has rendered and exist in DOM hierarchy
+        // its cid is stored here
+        _cids: {},
 
         // Internal state object used to store whether or not a View has been
         // taken over by layout manager and if it has been rendered into the
@@ -1039,7 +1072,12 @@ var defaultOptions = {
 
     // Use the insert method if the parent's `insert` argument is true.
     if (rentManager.insert) {
-      this.insert($root, $el);
+      if (manager.insertedAsPrepend) {
+        $root.prepend($el);
+        manager.insertedAsPrepend = false;
+      } else {
+        this.insert($root, $el);
+      }
     } else {
       this.html($root, $el);
     }
@@ -1058,6 +1096,7 @@ var defaultOptions = {
   // decent boost.  jQuery will use a DocumentFragment for the batch update,
   // but Cheerio in Node will not.
   htmlBatch: function(rootView, subViews, selector) {
+    console.log("JIAYU1");
     // Shorthand the parent manager object.
     var rentManager = rootView.__manager__;
     // Create a simplified manager object that tells partial() where
@@ -1072,7 +1111,7 @@ var defaultOptions = {
       // If a subView is present, don't push it.  This can only happen if
       // `keep: true`.  We do the keep check for speed as $.contains is not
       // cheap.
-      var exists = keep && $.contains(rootView.el, sub.el);
+      var exists = keep && $.contains(rootView, sub);
 
       // If there is an element and it doesn't already exist in our structure
       // attach it.
@@ -1099,7 +1138,7 @@ var defaultOptions = {
 
   // A method to determine if a View contains another.
   contains: function(parent, child) {
-    return $.contains(parent, child);
+    return !_.isUndefined(parent._cids[child.cid]);
   },
 
   // Based on:
